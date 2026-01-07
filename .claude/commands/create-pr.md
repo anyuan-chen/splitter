@@ -17,6 +17,7 @@ Create a new branch, commit changes, and submit a pull request.
 - Creates descriptive commit messages for each logical unit
 - Pushes branch to remote
 - Creates pull request with proper summary and test plan
+- NEVER SAY COAUTHORED BY CLAUDE CODE
 
 ## Guidelines for Automatic Commit Splitting
 
