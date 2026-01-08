@@ -18,6 +18,7 @@ type SpotifyConfig struct {
 
 // TrackMetadata represents metadata for a single track
 type TrackMetadata struct {
+	ID          string   `json:"id"`
 	Name        string   `json:"name"`
 	Artists     []string `json:"artists"`
 	Album       string   `json:"album"`
@@ -50,6 +51,7 @@ type spotifyPlaylistResponse struct {
 	Tracks      struct {
 		Items []struct {
 			Track struct {
+				ID         string `json:"id"`
 				Name       string `json:"name"`
 				DurationMs int    `json:"duration_ms"`
 				ExternalURLs struct {
@@ -75,12 +77,21 @@ type spotifyPlaylistResponse struct {
 
 // getAccessToken obtains an access token using client credentials flow
 func getAccessToken(config SpotifyConfig) (string, error) {
+	tokenResp, err := getAccessTokenWithExpiry(config)
+	if err != nil {
+		return "", err
+	}
+	return tokenResp.AccessToken, nil
+}
+
+// getAccessTokenWithExpiry obtains an access token and expiry information using client credentials flow
+func getAccessTokenWithExpiry(config SpotifyConfig) (*spotifyTokenResponse, error) {
 	data := url.Values{}
 	data.Set("grant_type", "client_credentials")
 
 	req, err := http.NewRequest("POST", "https://accounts.spotify.com/api/token", strings.NewReader(data.Encode()))
 	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -89,21 +100,21 @@ func getAccessToken(config SpotifyConfig) (string, error) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to get token: %w", err)
+		return nil, fmt.Errorf("failed to get token: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("token request failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("token request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var tokenResp spotifyTokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return "", fmt.Errorf("failed to decode token response: %w", err)
+		return nil, fmt.Errorf("failed to decode token response: %w", err)
 	}
 
-	return tokenResp.AccessToken, nil
+	return &tokenResp, nil
 }
 
 // fetchPlaylistPage fetches a single page of playlist data
@@ -150,8 +161,13 @@ func GetPlaylistMetadata(config SpotifyConfig) (*PlaylistMetadata, error) {
 		return nil, fmt.Errorf("failed to get access token: %w", err)
 	}
 
+	return GetPlaylistMetadataWithToken(config.PlaylistID, accessToken)
+}
+
+// GetPlaylistMetadataWithToken fetches all metadata for a Spotify playlist using a provided access token
+func GetPlaylistMetadataWithToken(playlistID, accessToken string) (*PlaylistMetadata, error) {
 	// Fetch first page of playlist
-	playlistResp, err := fetchPlaylistPage(config.PlaylistID, accessToken, "")
+	playlistResp, err := fetchPlaylistPage(playlistID, accessToken, "")
 	if err != nil {
 		return nil, err
 	}
@@ -172,6 +188,7 @@ func GetPlaylistMetadata(config SpotifyConfig) (*PlaylistMetadata, error) {
 		}
 
 		metadata.Tracks = append(metadata.Tracks, TrackMetadata{
+			ID:          track.ID,
 			Name:        track.Name,
 			Artists:     artists,
 			Album:       track.Album.Name,
@@ -186,7 +203,7 @@ func GetPlaylistMetadata(config SpotifyConfig) (*PlaylistMetadata, error) {
 	// Fetch remaining pages if playlist has more than 100 tracks
 	nextURL := playlistResp.Tracks.Next
 	for nextURL != "" {
-		pageResp, err := fetchPlaylistPage(config.PlaylistID, accessToken, nextURL)
+		pageResp, err := fetchPlaylistPage(playlistID, accessToken, nextURL)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch page: %w", err)
 		}
@@ -199,6 +216,7 @@ func GetPlaylistMetadata(config SpotifyConfig) (*PlaylistMetadata, error) {
 			}
 
 			metadata.Tracks = append(metadata.Tracks, TrackMetadata{
+				ID:          track.ID,
 				Name:        track.Name,
 				Artists:     artists,
 				Album:       track.Album.Name,

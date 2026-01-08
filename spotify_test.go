@@ -19,6 +19,7 @@ func TestFetchPlaylistPageParsing(t *testing.T) {
 		response.Tracks.Total = 1
 		response.Tracks.Items = []struct {
 			Track struct {
+				ID         string `json:"id"`
 				Name       string `json:"name"`
 				DurationMs int    `json:"duration_ms"`
 				ExternalURLs struct {
@@ -39,6 +40,7 @@ func TestFetchPlaylistPageParsing(t *testing.T) {
 		}{
 			{},
 		}
+		response.Tracks.Items[0].Track.ID = "test123"
 		response.Tracks.Items[0].Track.Name = "Test Song"
 		response.Tracks.Items[0].Track.DurationMs = 180000
 		response.Tracks.Items[0].Track.Artists = []struct {
