@@ -233,3 +233,68 @@ func GetPlaylistMetadataWithToken(playlistID, accessToken string) (*PlaylistMeta
 
 	return metadata, nil
 }
+
+// GetTrackMetadata fetches metadata for a single track using Spotify API
+func GetTrackMetadata(trackID, accessToken string) (*TrackMetadata, error) {
+	reqURL := fmt.Sprintf("https://api.spotify.com/v1/tracks/%s", trackID)
+
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch track: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("track request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var trackResp struct {
+		ID         string `json:"id"`
+		Name       string `json:"name"`
+		DurationMs int    `json:"duration_ms"`
+		ExternalURLs struct {
+			Spotify string `json:"spotify"`
+		} `json:"external_urls"`
+		PreviewURL   string `json:"preview_url"`
+		ExternalIDs struct {
+			ISRC string `json:"isrc"`
+		} `json:"external_ids"`
+		Artists []struct {
+			Name string `json:"name"`
+		} `json:"artists"`
+		Album struct {
+			Name        string `json:"name"`
+			ReleaseDate string `json:"release_date"`
+		} `json:"album"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&trackResp); err != nil {
+		return nil, fmt.Errorf("failed to decode track response: %w", err)
+	}
+
+	artists := make([]string, len(trackResp.Artists))
+	for i, artist := range trackResp.Artists {
+		artists[i] = artist.Name
+	}
+
+	return &TrackMetadata{
+		ID:          trackResp.ID,
+		Name:        trackResp.Name,
+		Artists:     artists,
+		Album:       trackResp.Album.Name,
+		DurationMs:  trackResp.DurationMs,
+		SpotifyURL:  trackResp.ExternalURLs.Spotify,
+		PreviewURL:  trackResp.PreviewURL,
+		ReleaseDate: trackResp.Album.ReleaseDate,
+		ISRC:        trackResp.ExternalIDs.ISRC,
+	}, nil
+}
