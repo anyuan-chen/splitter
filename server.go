@@ -28,6 +28,7 @@ type Server struct {
 	tokenMutex          sync.RWMutex
 	jobQueue            chan *DownloadJob
 	db                  *sql.DB
+	progress            *ProgressBroadcaster
 }
 
 // SetupPlaylistRequest represents the request to setup a playlist
@@ -45,6 +46,70 @@ type SetupPlaylistResponse struct {
 // DownloadJob represents a track download job
 type DownloadJob struct {
 	Track TrackMetadata
+}
+
+// ProgressEvent represents a download progress update (minimal)
+type ProgressEvent struct {
+	TrackID  string  `json:"track_id"`
+	Status   string  `json:"status"`
+	Progress float64 `json:"progress"`
+	Error    string  `json:"error,omitempty"`
+}
+
+// TrackState represents full track metadata for /tracks endpoint
+type TrackState struct {
+	TrackID  string  `json:"track_id"`
+	Name     string  `json:"name"`
+	Artists  string  `json:"artists"`
+	Status   string  `json:"status"`
+	Progress float64 `json:"progress"`
+	Error    string  `json:"error,omitempty"`
+}
+
+// ProgressBroadcaster manages SSE client subscriptions
+type ProgressBroadcaster struct {
+	events         chan ProgressEvent
+	newClients     chan chan ProgressEvent
+	closingClients chan chan ProgressEvent
+	clients        map[chan ProgressEvent]bool
+}
+
+// NewProgressBroadcaster creates and starts a new progress broadcaster
+func NewProgressBroadcaster() *ProgressBroadcaster {
+	b := &ProgressBroadcaster{
+		events:         make(chan ProgressEvent, 100), // Buffered for bursts of progress updates
+		newClients:     make(chan chan ProgressEvent),
+		closingClients: make(chan chan ProgressEvent),
+		clients:        make(map[chan ProgressEvent]bool),
+	}
+	go b.run()
+	return b
+}
+
+func (b *ProgressBroadcaster) run() {
+	for {
+		select {
+		case client := <-b.newClients:
+			b.clients[client] = true
+		case client := <-b.closingClients:
+			delete(b.clients, client)
+			close(client)
+		case event := <-b.events:
+			// Broadcast to all clients
+			for client := range b.clients {
+				select {
+				case client <- event:
+				default:
+					// Client is slow/blocked, skip
+				}
+			}
+		}
+	}
+}
+
+// SendEvent broadcasts a progress event to all connected clients
+func (b *ProgressBroadcaster) SendEvent(event ProgressEvent) {
+	b.events <- event
 }
 
 // initDB initializes the SQLite database and creates tables
@@ -205,14 +270,22 @@ func (s *Server) loadPendingJobs() error {
 // In Phase 1, we never close the channel, so workers run until server process exits
 func (s *Server) worker() {
 	for job := range s.jobQueue {
-		log.Printf("Downloading track: %s by %s",
-			job.Track.Name,
-			strings.Join(job.Track.Artists, ", "))
+		artistsStr := strings.Join(job.Track.Artists, ", ")
+		log.Printf("Downloading track: %s by %s", job.Track.Name, artistsStr)
 
-		// Mark as in_progress
+		// Send pending event (minimal)
+		s.progress.SendEvent(ProgressEvent{
+			TrackID:  job.Track.ID,
+			Status:   "pending",
+			Progress: 0,
+		})
+
+		// Mark as in_progress in database
 		s.db.Exec("UPDATE tracks SET download_status = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE track_id = ?", job.Track.ID)
 
-		err := DownloadTrackFromSpotify(job.Track)
+		// Download with progress reporting
+		err := DownloadTrackFromSpotifyWithProgress(job.Track, s.progress.events)
+
 		if err != nil {
 			log.Printf("Failed to download %s: %v", job.Track.Name, err)
 			s.db.Exec(`
@@ -220,15 +293,28 @@ func (s *Server) worker() {
 				SET download_status = 'failed', error_message = ?, updated_at = CURRENT_TIMESTAMP
 				WHERE track_id = ?
 			`, err.Error(), job.Track.ID)
+
+			// Send failed event (minimal)
+			s.progress.SendEvent(ProgressEvent{
+				TrackID:  job.Track.ID,
+				Status:   "failed",
+				Progress: 0,
+				Error:    err.Error(),
+			})
 		} else {
-			log.Printf("Downloaded: %s → songs/%s/base.mp3",
-				job.Track.Name,
-				job.Track.ID)
+			log.Printf("Downloaded: %s → songs/%s/base.mp3", job.Track.Name, job.Track.ID)
 			s.db.Exec(`
 				UPDATE tracks
 				SET download_status = 'completed', error_message = NULL, updated_at = CURRENT_TIMESTAMP
 				WHERE track_id = ?
 			`, job.Track.ID)
+
+			// Send completed event (minimal)
+			s.progress.SendEvent(ProgressEvent{
+				TrackID:  job.Track.ID,
+				Status:   "completed",
+				Progress: 100,
+			})
 		}
 	}
 }
@@ -351,6 +437,90 @@ func (s *Server) setupPlaylistHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Setup playlist: %s (%d tracks), downloads queued", metadata.Name, metadata.TotalTracks)
 }
 
+// tracksHandler returns current state snapshot of all tracks
+func (s *Server) tracksHandler(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.Query("SELECT track_id, name, artists, download_status, error_message FROM tracks")
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var tracks []TrackState
+	for rows.Next() {
+		var trackID, name, artists, status string
+		var errorMsg sql.NullString
+		rows.Scan(&trackID, &name, &artists, &status, &errorMsg)
+
+		var progress float64
+		var eventStatus string
+		switch status {
+		case "completed":
+			progress = 100
+			eventStatus = "completed"
+		case "in_progress":
+			progress = 0 // Real-time progress via SSE
+			eventStatus = "downloading"
+		case "failed":
+			progress = 0
+			eventStatus = "failed"
+		default:
+			progress = 0
+			eventStatus = "pending"
+		}
+
+		track := TrackState{
+			TrackID:  trackID,
+			Name:     name,
+			Artists:  artists,
+			Status:   eventStatus,
+			Progress: progress,
+		}
+		if errorMsg.Valid {
+			track.Error = errorMsg.String
+		}
+		tracks = append(tracks, track)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(tracks)
+}
+
+// progressStreamHandler streams progress updates via SSE
+func (s *Server) progressStreamHandler(w http.ResponseWriter, r *http.Request) {
+	// Set SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// Create client channel (unbuffered - backpressure from slow clients)
+	clientChan := make(chan ProgressEvent)
+	s.progress.newClients <- clientChan
+
+	// Cleanup on disconnect
+	defer func() {
+		s.progress.closingClients <- clientChan
+	}()
+
+	// Stream updates only (no initial state - client gets that from /tracks)
+	for {
+		select {
+		case event := <-clientChan:
+			data, err := json.Marshal(event)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
 func main() {
 	// Initialize database
 	db, err := initDB()
@@ -365,6 +535,7 @@ func main() {
 		spotifyClientSecret: os.Getenv("SPOTIFY_CLIENT_SECRET"),
 		jobQueue:            make(chan *DownloadJob, 1000),
 		db:                  db,
+		progress:            NewProgressBroadcaster(),
 	}
 
 	if server.spotifyClientID == "" || server.spotifyClientSecret == "" {
@@ -390,6 +561,8 @@ func main() {
 
 	// Register handlers
 	http.HandleFunc("/setup-playlist", server.setupPlaylistHandler)
+	http.HandleFunc("/tracks", server.tracksHandler)
+	http.HandleFunc("/progress/stream", server.progressStreamHandler)
 
 	port := os.Getenv("PORT")
 	if port == "" {
