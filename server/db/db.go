@@ -318,3 +318,25 @@ func (db *DB) GetTrack(trackID string) (*models.TrackState, error) {
 
 	return &track, nil
 }
+
+// GetPlaylistTrackIDs returns all track IDs for a given playlist
+func (db *DB) GetPlaylistTrackIDs(playlistID string) (map[string]bool, error) {
+	rows, err := db.Query(`
+		SELECT track_id FROM playlist_tracks
+		WHERE playlist_id = ?
+	`, playlistID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	trackIDs := make(map[string]bool)
+	for rows.Next() {
+		var trackID string
+		if err := rows.Scan(&trackID); err != nil {
+			continue
+		}
+		trackIDs[trackID] = true
+	}
+	return trackIDs, nil
+}

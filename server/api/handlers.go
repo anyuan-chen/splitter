@@ -137,6 +137,7 @@ func (h *Handler) GetTrackHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // ProgressStreamHandler streams progress updates via SSE
+// Supports optional ?playlist_id=<id> query parameter to filter events
 func (h *Handler) ProgressStreamHandler(w http.ResponseWriter, r *http.Request) {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -144,8 +145,21 @@ func (h *Handler) ProgressStreamHandler(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	// Create client channel
-	clientChan := h.Progress.RegisterClient()
+	// Check for playlist filter
+	var trackIDFilter map[string]bool
+	playlistID := r.URL.Query().Get("playlist_id")
+	if playlistID != "" {
+		var err error
+		trackIDFilter, err = h.DB.GetPlaylistTrackIDs(playlistID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to get playlist tracks: %v", err), http.StatusInternalServerError)
+			return
+		}
+		log.Printf("Client subscribed to playlist %s with %d tracks", playlistID, len(trackIDFilter))
+	}
+
+	// Create client channel with optional filter
+	clientChan := h.Progress.RegisterClient(trackIDFilter)
 
 	// Cleanup on disconnect
 	defer func() {
