@@ -134,7 +134,12 @@ func main() {
 	// Register handlers with CORS middleware
 	http.Handle("/setup-playlist", enableCORS(http.HandlerFunc(apiHandler.SetupPlaylistHandler)))
 	http.Handle("/tracks", enableCORS(http.HandlerFunc(apiHandler.TracksHandler)))
+	http.Handle("/tracks/", enableCORS(http.HandlerFunc(apiHandler.GetTrackHandler))) // Note: Trailing slash is important for subtree matching, but for specific ID we might need careful handling
 	http.Handle("/progress/stream", enableCORS(http.HandlerFunc(apiHandler.ProgressStreamHandler)))
+
+	// Serve static files
+	fs := http.FileServer(http.Dir("./songs"))
+	http.Handle("/songs/", http.StripPrefix("/songs/", enableCORS(fs)))
 
 	port := os.Getenv("PORT")
 	if port == "" {

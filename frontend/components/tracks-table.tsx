@@ -11,6 +11,7 @@ import {
 import { Progress } from "@/components/ui/progress";
 import { TrackState } from "@/lib/api";
 import { Loader2, CheckCircle2, XCircle, AlertCircle } from "lucide-react";
+import Link from "next/link";
 
 interface TracksTableProps {
   tracks: TrackState[];
@@ -55,13 +56,13 @@ const StatusWithProgress = ({
 export function TracksTable({ tracks }: TracksTableProps) {
   return (
     <div className="rounded-md border">
-      <Table>
+      <Table className="table-fixed">
         <TableHeader>
           <TableRow>
-            <TableHead>Track Name</TableHead>
-            <TableHead>Artist(s)</TableHead>
-            <TableHead>Download Status</TableHead>
-            <TableHead>Demucs Status</TableHead>
+            <TableHead className="w-[30%]">Track Name</TableHead>
+            <TableHead className="w-[20%]">Artist(s)</TableHead>
+            <TableHead className="w-[25%]">Download Status</TableHead>
+            <TableHead className="w-[25%]">Demucs Status</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -74,8 +75,15 @@ export function TracksTable({ tracks }: TracksTableProps) {
           ) : (
             tracks.map((track) => (
               <TableRow key={track.track_id}>
-                <TableCell className="font-medium">{track.name}</TableCell>
-                <TableCell>{track.artists}</TableCell>
+                <TableCell className="font-medium truncate" title={track.name}>
+                  <Link 
+                    href={`/tracks/${track.track_id}`} 
+                    className="hover:underline hover:text-primary"
+                  >
+                    {track.name}
+                  </Link>
+                </TableCell>
+                <TableCell className="truncate" title={track.artists}>{track.artists}</TableCell>
                 <TableCell>
                   <StatusWithProgress 
                     status={track.download_status} 

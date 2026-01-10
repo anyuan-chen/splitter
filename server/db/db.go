@@ -277,3 +277,44 @@ func (db *DB) VerifyDownloadStatus(checkFileExists func(string) bool) error {
 	}
 	return nil
 }
+
+// GetTrack returns a single track by ID
+func (db *DB) GetTrack(trackID string) (*models.TrackState, error) {
+	var track models.TrackState
+	var downloadError, demucsError sql.NullString
+	var downloadStatus, demucsStatus string
+
+	err := db.QueryRow(`
+		SELECT track_id, name, artists,
+		       download_status, error_message,
+		       demucs_status, demucs_error_message
+		FROM tracks
+		WHERE track_id = ?
+	`, trackID).Scan(
+		&track.TrackID, &track.Name, &track.Artists,
+		&downloadStatus, &downloadError,
+		&demucsStatus, &demucsError,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	track.DownloadStatus = downloadStatus
+	track.DemucsStatus = demucsStatus
+
+	if downloadStatus == "completed" {
+		track.DownloadProgress = 100
+	}
+	if demucsStatus == "completed" {
+		track.DemucsProgress = 100
+	}
+
+	if downloadError.Valid {
+		track.DownloadError = downloadError.String
+	}
+	if demucsError.Valid {
+		track.DemucsError = demucsError.String
+	}
+
+	return &track, nil
+}
