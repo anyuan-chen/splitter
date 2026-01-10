@@ -111,7 +111,7 @@ func (wm *WorkerManager) DemucsWorker(demucsQueue <-chan *models.DemucsJob) {
 				Error:    err.Error(),
 			})
 		} else {
-			log.Printf("Demucs completed: %s → songs/%s/demucs/", job.Track.Name, job.Track.ID)
+			log.Printf("Demucs completed: %s → songs/%s/mdx_extra_q/base/", job.Track.Name, job.Track.ID)
 			wm.db.UpdateDemucsStatus(job.Track.ID, "completed", "")
 
 			// Send completed event
