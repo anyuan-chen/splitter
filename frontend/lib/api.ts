@@ -78,4 +78,19 @@ export const api = {
   createProgressSource(): EventSource {
     return new EventSource(`${API_BASE_URL}/progress/stream`);
   },
+
+  /**
+   * Fetch a single track by ID.
+   */
+  async getTrack(trackId: string): Promise<TrackState> {
+    const response = await fetch(`${API_BASE_URL}/tracks/${trackId}`);
+    return handleResponse<TrackState>(response);
+  },
+
+  /**
+   * Get the base URL for audio files.
+   */
+  getAudioUrl(trackId: string, filename: string): string {
+    return `${API_BASE_URL}/songs/${trackId}/${filename}`;
+  },
 };

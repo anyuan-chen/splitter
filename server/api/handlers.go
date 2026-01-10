@@ -111,6 +111,31 @@ func (h *Handler) TracksHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(tracks)
 }
 
+// GetTrackHandler returns metadata for a single track
+func (h *Handler) GetTrackHandler(w http.ResponseWriter, r *http.Request) {
+	// Extract track ID from URL path (assuming /tracks/{id})
+	// Since we are using standard net/http, we might need to parse it manually if using StripPrefix or similar,
+	// but here we will assume it's passed as a query param or parse it from path if using main router.
+	// Actually, let's assume the router in main.go handles the path pattern or we parse it here.
+	// For simplicity with standard mux, we'll strip prefix in main.go or simple parsing:
+	// Path: /tracks/<id>
+
+	id := filepath.Base(r.URL.Path)
+	if id == "" || id == "tracks" {
+		http.Error(w, "Track ID required", http.StatusBadRequest)
+		return
+	}
+
+	track, err := h.DB.GetTrack(id)
+	if err != nil {
+		http.Error(w, "Track not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(track)
+}
+
 // ProgressStreamHandler streams progress updates via SSE
 func (h *Handler) ProgressStreamHandler(w http.ResponseWriter, r *http.Request) {
 	// Set SSE headers
