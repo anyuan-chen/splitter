@@ -1,4 +1,4 @@
-package main
+package worker
 
 import (
 	"bufio"
@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"separate/server/models"
 )
 
 // buildYtDlpArgsWithPath builds yt-dlp arguments with a specific output path
@@ -23,7 +25,7 @@ type YouTubeSearchResult struct {
 }
 
 // SearchYouTube searches YouTube for a track and returns the top result
-func SearchYouTube(track TrackMetadata) (*YouTubeSearchResult, error) {
+func SearchYouTube(track models.TrackMetadata) (*YouTubeSearchResult, error) {
 	// Build search query from track metadata
 	query := fmt.Sprintf("%s %s", strings.Join(track.Artists, " "), track.Name)
 	searchQuery := fmt.Sprintf("ytsearch1:%s", query)
@@ -61,39 +63,8 @@ func SearchYouTube(track TrackMetadata) (*YouTubeSearchResult, error) {
 	}, nil
 }
 
-// DownloadTrackFromSpotify searches YouTube for a Spotify track and downloads it
-// Files are saved to songs/[spotify_track_id]/base.mp3
-func DownloadTrackFromSpotify(track TrackMetadata) error {
-	// Search YouTube for the track
-	result, err := SearchYouTube(track)
-	if err != nil {
-		return fmt.Errorf("failed to search YouTube: %w", err)
-	}
-
-	// Create directory structure: songs/[track_id]
-	trackDir := filepath.Join("songs", track.ID)
-	if err := os.MkdirAll(trackDir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
-	}
-
-	// Download using helper
-	outputPath := filepath.Join(trackDir, "base.mp3")
-	args := buildYtDlpArgsWithPath(result.URL, outputPath)
-	cmd := exec.Command("yt-dlp", args...)
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("yt-dlp download failed: %w\nOutput: %s", err, string(output))
-	}
-
-	fmt.Printf("Downloaded: %s by %s -> %s\n", track.Name, strings.Join(track.Artists, ", "), outputPath)
-	return nil
-}
-
 // DownloadTrackFromSpotifyWithProgress downloads and reports progress
-// Each worker calls this with its own track, so track context is preserved.
-// Each yt-dlp process has its own stderr pipe, so there's no mixing between workers.
-func DownloadTrackFromSpotifyWithProgress(track TrackMetadata, progressChan chan<- ProgressEvent) error {
+func DownloadTrackFromSpotifyWithProgress(track models.TrackMetadata, progressChan chan<- models.ProgressEvent) error {
 	// Search YouTube for the track
 	result, err := SearchYouTube(track)
 	if err != nil {
@@ -135,8 +106,9 @@ func DownloadTrackFromSpotifyWithProgress(track TrackMetadata, progressChan chan
 				progress := parseProgress(line)
 				if progress >= 0 {
 					// Send event with this track's ID
-					progressChan <- ProgressEvent{
-						TrackID:  track.ID, // From function parameter, not from stdout
+					progressChan <- models.ProgressEvent{
+						TrackID:  track.ID,
+						Type:     "download",
 						Status:   "downloading",
 						Progress: progress,
 					}

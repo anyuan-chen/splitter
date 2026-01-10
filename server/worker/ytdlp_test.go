@@ -1,18 +1,27 @@
-package main
+package worker
 
 import (
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/joho/godotenv"
+
+	"separate/server/models"
 )
+
+func init() {
+	// Try to load .env from root (../../.env relative to server/worker)
+	_ = godotenv.Load("../../.env")
+}
 
 func TestSearchYouTubeIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
 
-	track := TrackMetadata{
+	track := models.TrackMetadata{
 		Name:    "The Louvre",
 		Artists: []string{"Lorde"},
 		Album:   "Melodrama",
@@ -50,14 +59,22 @@ func TestDownloadTrackFromSpotifyIntegration(t *testing.T) {
 		t.Skip("Skipping integration test in short mode")
 	}
 
-	track := TrackMetadata{
+	track := models.TrackMetadata{
 		ID:      "5q4BpnMrYEFzLO0dYODj6J",
 		Name:    "The Louvre",
 		Artists: []string{"Lorde"},
 		Album:   "Melodrama",
 	}
 
-	err := DownloadTrackFromSpotify(track)
+	// Create a dummy channel for progress
+	progressChan := make(chan models.ProgressEvent, 100)
+	// Drain channel in background
+	go func() {
+		for range progressChan {
+		}
+	}()
+
+	err := DownloadTrackFromSpotifyWithProgress(track, progressChan)
 	if err != nil {
 		t.Fatalf("DownloadTrackFromSpotify failed: %v", err)
 	}

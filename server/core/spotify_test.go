@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"encoding/json"
@@ -6,37 +6,28 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+
+	"github.com/joho/godotenv"
+
+	"separate/server/models"
 )
+
+func init() {
+	// Try to load .env from root (../../.env relative to server/core)
+	_ = godotenv.Load("../../.env")
+}
 
 // Unit Tests
 
 func TestFetchPlaylistPageParsing(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		response := spotifyPlaylistResponse{
+		response := playlistResponse{
 			Name:        "Test Playlist",
 			Description: "A test playlist",
 		}
 		response.Tracks.Total = 1
 		response.Tracks.Items = []struct {
-			Track struct {
-				ID         string `json:"id"`
-				Name       string `json:"name"`
-				DurationMs int    `json:"duration_ms"`
-				ExternalURLs struct {
-					Spotify string `json:"spotify"`
-				} `json:"external_urls"`
-				PreviewURL   string `json:"preview_url"`
-				ExternalIDs struct {
-					ISRC string `json:"isrc"`
-				} `json:"external_ids"`
-				Artists []struct {
-					Name string `json:"name"`
-				} `json:"artists"`
-				Album struct {
-					Name        string `json:"name"`
-					ReleaseDate string `json:"release_date"`
-				} `json:"album"`
-			} `json:"track"`
+			Track trackObject `json:"track"`
 		}{
 			{},
 		}
@@ -55,7 +46,7 @@ func TestFetchPlaylistPageParsing(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resp, err := fetchPlaylistPage("test", "token", server.URL)
+	_, resp, err := fetchPlaylistPage("test", "token", server.URL)
 	if err != nil {
 		t.Fatalf("Failed to fetch: %v", err)
 	}
@@ -88,13 +79,19 @@ func TestGetPlaylistMetadataIntegration(t *testing.T) {
 		t.Fatal("Requires SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, and TEST_SPOTIFY_PLAYLIST_ID environment variables")
 	}
 
-	config := SpotifyConfig{
+	config := models.SpotifyConfig{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		PlaylistID:   playlistID,
 	}
 
-	metadata, err := GetPlaylistMetadata(config)
+	// Used GetAccessToken to get token first
+	token, err := GetAccessToken(config)
+	if err != nil {
+		t.Fatalf("Failed to get token: %v", err)
+	}
+
+	metadata, err := GetPlaylistMetadataWithToken(config.PlaylistID, token)
 	if err != nil {
 		t.Fatalf("GetPlaylistMetadata failed: %v", err)
 	}
