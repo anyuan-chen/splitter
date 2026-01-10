@@ -1,4 +1,4 @@
-package main
+package worker
 
 import (
 	"bufio"
@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"separate/server/models"
 )
 
 const (
@@ -22,14 +24,7 @@ var (
 	dockerInitErr  error
 )
 
-// DemucsJob represents a Demucs separation job
-type DemucsJob struct {
-	Track     TrackMetadata
-	InputPath string
-}
-
 // ensureDockerContainer ensures the Demucs Docker container is running
-// Uses sync.Once to ensure we only initialize once across all workers
 func ensureDockerContainer() error {
 	dockerInitOnce.Do(func() {
 		dockerInitErr = startDockerContainer()
@@ -84,7 +79,6 @@ func startDockerContainer() error {
 		}
 
 		// Create new container that stays running
-		// Use --entrypoint to override the image's entrypoint and keep it alive
 		createCmd := exec.Command("docker", "run", "-d",
 			"--name", demucsContainerName,
 			"--entrypoint", "sleep",
@@ -102,15 +96,13 @@ func startDockerContainer() error {
 }
 
 // ProcessTrackWithDemucs separates audio using Demucs and reports progress
-func ProcessTrackWithDemucs(track TrackMetadata, inputPath string, progressChan chan<- ProgressEvent) error {
+func ProcessTrackWithDemucs(track models.TrackMetadata, inputPath string, progressChan chan<- models.ProgressEvent) error {
 	// Ensure Docker container is running
 	if err := ensureDockerContainer(); err != nil {
 		return fmt.Errorf("failed to ensure Docker container: %w", err)
 	}
 
 	// Convert to paths inside container
-	// Input: songs/{track_id}/base.mp3 -> /songs/{track_id}/base.mp3
-	// Output: songs/{track_id}/demucs/ -> /songs/{track_id}
 	trackID := track.ID
 	containerInputPath := fmt.Sprintf("/songs/%s/base.mp3", trackID)
 	containerOutputDir := fmt.Sprintf("/songs/%s", trackID)
@@ -121,30 +113,27 @@ func ProcessTrackWithDemucs(track TrackMetadata, inputPath string, progressChan 
 		return fmt.Errorf("failed to create demucs output directory: %w", err)
 	}
 
-	// Run demucs command in the persistent container using docker exec
-	// Use default mdx_extra_q model - best quality available
-	// Output as WAV (MP3 requires ffmpeg which isn't in the container)
-	// Note: Uses ~6-7GB RAM, may hit memory limits on systems with <8GB
+	// Run demucs command
 	args := []string{
 		"exec",
-		"-e", "PYTHONUNBUFFERED=1", // Force unbuffered output
+		"-e", "PYTHONUNBUFFERED=1",
 		demucsContainerName,
 		"demucs",
 		"--device", "cpu",
-		"-v", // Verbose mode for more output
+		"-v",
 		"-o", containerOutputDir,
 		containerInputPath,
 	}
 
 	cmd := exec.Command("docker", args...)
 
-	// Create pipes for BOTH stdout and stderr (critical!)
-	stderr, err := cmd.StderrPipe() // tqdm progress goes here
+	// Create pipes
+	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
-	stdout, err := cmd.StdoutPipe() // Docker exec messages go here
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
@@ -162,17 +151,14 @@ func ProcessTrackWithDemucs(track TrackMetadata, inputPath string, progressChan 
 	ansiRegex := regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 	// Helper function to process each progress update
-	processDemucsOutput := func(line, trackID string, currentModel *int, lastProgress *float64, ansiRegex *regexp.Regexp, progressChan chan<- ProgressEvent) {
-		// Strip ANSI escape codes
+	processDemucsOutput := func(line, trackID string, currentModel *int, lastProgress *float64, ansiRegex *regexp.Regexp, progressChan chan<- models.ProgressEvent) {
 		cleanLine := ansiRegex.ReplaceAllString(line, "")
 		cleanLine = strings.TrimSpace(cleanLine)
 
-		// Look for percentage: "  45%|..."
 		if !strings.Contains(cleanLine, "%") {
 			return
 		}
 
-		// Extract percentage using regex: find digits followed by %
 		percentRegex := regexp.MustCompile(`^\s*(\d+)%`)
 		matches := percentRegex.FindStringSubmatch(cleanLine)
 		if len(matches) < 2 {
@@ -185,26 +171,31 @@ func ProcessTrackWithDemucs(track TrackMetadata, inputPath string, progressChan 
 			return
 		}
 
-		// Detect model transitions (progress dropped from high to low)
 		if modelProgress < *lastProgress-50 {
 			*currentModel++
 		}
 		*lastProgress = modelProgress
 
-		// Map to overall 0-100%
-		// Model 0 (first): 0-100% → 0-25%
-		// Model 1: 0-100% → 25-50%
-		// Model 2: 0-100% → 50-75%
-		// Model 3: 0-100% → 75-100%
-		baseProgress := float64(*currentModel) * 25.0
-		overallProgress := baseProgress + (modelProgress / 4.0)
+		// Calculate progress by averaging all 4 models:
+		// - Completed models contribute 100%
+		// - Current model contributes its actual progress
+		// - Future models contribute 0%
+		var totalProgress float64
+		for i := 0; i < 4; i++ {
+			if i < *currentModel {
+				totalProgress += 100.0 // Completed models
+			} else if i == *currentModel {
+				totalProgress += modelProgress // Current model
+			}
+			// Future models contribute 0
+		}
+		overallProgress := totalProgress / 4.0
 
-		// Clamp to 0-100
 		if overallProgress > 100 {
 			overallProgress = 100
 		}
 
-		progressChan <- ProgressEvent{
+		progressChan <- models.ProgressEvent{
 			TrackID:  trackID,
 			Type:     "demucs",
 			Status:   "processing",
@@ -212,16 +203,13 @@ func ProcessTrackWithDemucs(track TrackMetadata, inputPath string, progressChan 
 		}
 	}
 
-	// Read stderr (tqdm progress) in goroutine
+	// Read stderr (tqdm progress)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
 			line := scanner.Text()
-
-			// tqdm uses \r (carriage returns) to overwrite progress on the same line
-			// Split the line by \r to get individual progress updates
 			updates := strings.Split(line, "\r")
 			for _, update := range updates {
 				if update == "" {
@@ -232,20 +220,18 @@ func ProcessTrackWithDemucs(track TrackMetadata, inputPath string, progressChan 
 		}
 	}()
 
-	// Read stdout (Docker messages) in goroutine - MUST read this too!
+	// Read stdout (Docker messages) - discard but must read
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
-			// Just discard stdout (contains informational messages)
 			_ = scanner.Text()
 		}
 	}()
 
-	// Wait for command AND goroutines
 	cmdErr := cmd.Wait()
-	wg.Wait() // Ensure both readers finish
+	wg.Wait()
 
 	if cmdErr != nil {
 		return fmt.Errorf("demucs processing failed: %w", cmdErr)
@@ -253,29 +239,4 @@ func ProcessTrackWithDemucs(track TrackMetadata, inputPath string, progressChan 
 
 	fmt.Printf("Demucs processing completed: %s → %s\n", inputPath, outputDir)
 	return nil
-}
-
-// parseDemucsProgress extracts progress from Demucs output
-// Demucs output typically looks like: "Separated sources for 1 song in 45.2s"
-// or progress bars like: "Processing: 23%"
-func parseDemucsProgress(line, trackID string, progressChan chan<- ProgressEvent) {
-	// Check for percentage patterns
-	// Demucs may output: "23%", "Processing: 45%", etc.
-	if strings.Contains(line, "%") {
-		parts := strings.Fields(line)
-		for _, part := range parts {
-			if strings.HasSuffix(part, "%") {
-				percentStr := strings.TrimSuffix(part, "%")
-				if progress, err := strconv.ParseFloat(percentStr, 64); err == nil && progress >= 0 && progress <= 100 {
-					progressChan <- ProgressEvent{
-						TrackID:  trackID,
-						Type:     "demucs",
-						Status:   "processing",
-						Progress: progress,
-					}
-					return
-				}
-			}
-		}
-	}
 }

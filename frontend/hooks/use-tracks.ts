@@ -6,21 +6,21 @@ export function useTracks() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  const fetchTracks = useCallback(async () => {
+    try {
+      const initialTracks = await api.getTracks();
+      setTracks(initialTracks);
+      setLoading(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to fetch tracks');
+      setLoading(false);
+    }
+  }, []);
+
   // Initial fetch
   useEffect(() => {
-    const fetchTracks = async () => {
-      try {
-        const initialTracks = await api.getTracks();
-        setTracks(initialTracks);
-        setLoading(false);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to fetch tracks');
-        setLoading(false);
-      }
-    };
-
     fetchTracks();
-  }, []);
+  }, [fetchTracks]);
 
   // Handle progress events
   const handleProgressEvent = useCallback((event: ProgressEvent) => {
@@ -46,7 +46,10 @@ export function useTracks() {
             updatedTrack.download_error = event.error;
           }
         } else if (event.type === 'demucs') {
-           if (event.status === 'processing') {
+          if (event.status === 'pending') {
+            updatedTrack.demucs_status = 'in_progress';
+            updatedTrack.demucs_progress = 0;
+          } else if (event.status === 'processing') {
             updatedTrack.demucs_status = 'in_progress';
             updatedTrack.demucs_progress = event.progress;
           } else if (event.status === 'completed') {
@@ -89,5 +92,5 @@ export function useTracks() {
     };
   }, [loading, handleProgressEvent]);
 
-  return { tracks, loading, error };
+  return { tracks, loading, error, refresh: fetchTracks };
 }
