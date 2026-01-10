@@ -1,3 +1,5 @@
 .env
 songs/
-queue.db
+*.db
+separate
+server
