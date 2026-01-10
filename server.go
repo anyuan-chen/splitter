@@ -16,7 +16,8 @@ import (
 )
 
 const (
-	numWorkers = 8
+	numWorkers       = 8
+	numDemucsWorkers = 1 // Demucs is slow, process one at a time
 )
 
 // Server holds the application state
@@ -27,6 +28,7 @@ type Server struct {
 	tokenExpiry         time.Time
 	tokenMutex          sync.RWMutex
 	jobQueue            chan *DownloadJob
+	demucsQueue         chan *DemucsJob
 	db                  *sql.DB
 	progress            *ProgressBroadcaster
 }
@@ -48,22 +50,26 @@ type DownloadJob struct {
 	Track TrackMetadata
 }
 
-// ProgressEvent represents a download progress update (minimal)
+// ProgressEvent represents a download/processing progress update (minimal)
 type ProgressEvent struct {
 	TrackID  string  `json:"track_id"`
-	Status   string  `json:"status"`
-	Progress float64 `json:"progress"`
+	Type     string  `json:"type"`     // "download" or "demucs"
+	Status   string  `json:"status"`   // "pending", "downloading"/"processing", "completed", "failed"
+	Progress float64 `json:"progress"` // 0.0 to 100.0
 	Error    string  `json:"error,omitempty"`
 }
 
 // TrackState represents full track metadata for /tracks endpoint
 type TrackState struct {
-	TrackID  string  `json:"track_id"`
-	Name     string  `json:"name"`
-	Artists  string  `json:"artists"`
-	Status   string  `json:"status"`
-	Progress float64 `json:"progress"`
-	Error    string  `json:"error,omitempty"`
+	TrackID       string  `json:"track_id"`
+	Name          string  `json:"name"`
+	Artists       string  `json:"artists"`
+	DownloadStatus string  `json:"download_status"`
+	DownloadProgress float64 `json:"download_progress"`
+	DownloadError string  `json:"download_error,omitempty"`
+	DemucsStatus  string  `json:"demucs_status"`
+	DemucsProgress float64 `json:"demucs_progress"`
+	DemucsError   string  `json:"demucs_error,omitempty"`
 }
 
 // ProgressBroadcaster manages SSE client subscriptions
@@ -127,10 +133,13 @@ func initDB() (*sql.DB, error) {
 		artists TEXT NOT NULL,
 		download_status TEXT NOT NULL,
 		error_message TEXT,
+		demucs_status TEXT DEFAULT 'pending',
+		demucs_error_message TEXT,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);
 	CREATE INDEX IF NOT EXISTS idx_download_status ON tracks(download_status);
+	CREATE INDEX IF NOT EXISTS idx_demucs_status ON tracks(demucs_status);
 
 	CREATE TABLE IF NOT EXISTS playlist_tracks (
 		playlist_id TEXT NOT NULL,
@@ -142,7 +151,23 @@ func initDB() (*sql.DB, error) {
 	`
 
 	_, err = db.Exec(schema)
-	return db, err
+	if err != nil {
+		return nil, err
+	}
+
+	// Migration: add demucs columns if they don't exist
+	migrations := []string{
+		`ALTER TABLE tracks ADD COLUMN demucs_status TEXT DEFAULT 'pending'`,
+		`ALTER TABLE tracks ADD COLUMN demucs_error_message TEXT`,
+		`CREATE INDEX IF NOT EXISTS idx_demucs_status ON tracks(demucs_status)`,
+	}
+
+	for _, migration := range migrations {
+		// Ignore errors if column already exists
+		db.Exec(migration)
+	}
+
+	return db, nil
 }
 
 // getAccessToken returns a valid access token, fetching a new one if needed
@@ -265,6 +290,50 @@ func (s *Server) loadPendingJobs() error {
 	return nil
 }
 
+// loadPendingDemucsJobs loads tracks that are downloaded but need Demucs processing
+func (s *Server) loadPendingDemucsJobs() error {
+	rows, err := s.db.Query(`
+		SELECT track_id, name, artists
+		FROM tracks
+		WHERE download_status = 'completed' AND demucs_status = 'pending'
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() {
+		var trackID, name, artists string
+		if err := rows.Scan(&trackID, &name, &artists); err != nil {
+			log.Printf("Failed to scan row: %v", err)
+			continue
+		}
+
+		// Parse artists string back to slice
+		artistsList := strings.Split(artists, ", ")
+
+		track := TrackMetadata{
+			ID:      trackID,
+			Name:    name,
+			Artists: artistsList,
+		}
+
+		inputPath := filepath.Join("songs", trackID, "base.mp3")
+		s.demucsQueue <- &DemucsJob{
+			Track:     track,
+			InputPath: inputPath,
+		}
+		count++
+	}
+
+	if count > 0 {
+		log.Printf("Queued %d tracks for Demucs processing", count)
+	}
+
+	return nil
+}
+
 // worker processes download jobs from the job queue
 // This loop runs forever until the channel is closed
 // In Phase 1, we never close the channel, so workers run until server process exits
@@ -273,9 +342,10 @@ func (s *Server) worker() {
 		artistsStr := strings.Join(job.Track.Artists, ", ")
 		log.Printf("Downloading track: %s by %s", job.Track.Name, artistsStr)
 
-		// Send pending event (minimal)
+		// Send pending event
 		s.progress.SendEvent(ProgressEvent{
 			TrackID:  job.Track.ID,
+			Type:     "download",
 			Status:   "pending",
 			Progress: 0,
 		})
@@ -294,24 +364,88 @@ func (s *Server) worker() {
 				WHERE track_id = ?
 			`, err.Error(), job.Track.ID)
 
-			// Send failed event (minimal)
+			// Send failed event
 			s.progress.SendEvent(ProgressEvent{
 				TrackID:  job.Track.ID,
+				Type:     "download",
 				Status:   "failed",
 				Progress: 0,
 				Error:    err.Error(),
 			})
 		} else {
-			log.Printf("Downloaded: %s → songs/%s/base.mp3", job.Track.Name, job.Track.ID)
+			outputPath := filepath.Join("songs", job.Track.ID, "base.mp3")
+			log.Printf("Downloaded: %s → %s", job.Track.Name, outputPath)
 			s.db.Exec(`
 				UPDATE tracks
 				SET download_status = 'completed', error_message = NULL, updated_at = CURRENT_TIMESTAMP
 				WHERE track_id = ?
 			`, job.Track.ID)
 
-			// Send completed event (minimal)
+			// Send completed event
 			s.progress.SendEvent(ProgressEvent{
 				TrackID:  job.Track.ID,
+				Type:     "download",
+				Status:   "completed",
+				Progress: 100,
+			})
+
+			// Automatically queue Demucs processing
+			s.demucsQueue <- &DemucsJob{
+				Track:     job.Track,
+				InputPath: outputPath,
+			}
+		}
+	}
+}
+
+// demucsWorker processes Demucs separation jobs from the demucs queue
+func (s *Server) demucsWorker() {
+	for job := range s.demucsQueue {
+		artistsStr := strings.Join(job.Track.Artists, ", ")
+		log.Printf("Processing Demucs: %s by %s", job.Track.Name, artistsStr)
+
+		// Send pending event
+		s.progress.SendEvent(ProgressEvent{
+			TrackID:  job.Track.ID,
+			Type:     "demucs",
+			Status:   "pending",
+			Progress: 0,
+		})
+
+		// Mark as in_progress in database
+		s.db.Exec("UPDATE tracks SET demucs_status = 'in_progress', updated_at = CURRENT_TIMESTAMP WHERE track_id = ?", job.Track.ID)
+
+		// Process with Demucs and progress reporting
+		err := ProcessTrackWithDemucs(job.Track, job.InputPath, s.progress.events)
+
+		if err != nil {
+			log.Printf("Failed to process Demucs for %s: %v", job.Track.Name, err)
+			s.db.Exec(`
+				UPDATE tracks
+				SET demucs_status = 'failed', demucs_error_message = ?, updated_at = CURRENT_TIMESTAMP
+				WHERE track_id = ?
+			`, err.Error(), job.Track.ID)
+
+			// Send failed event
+			s.progress.SendEvent(ProgressEvent{
+				TrackID:  job.Track.ID,
+				Type:     "demucs",
+				Status:   "failed",
+				Progress: 0,
+				Error:    err.Error(),
+			})
+		} else {
+			log.Printf("Demucs completed: %s → songs/%s/demucs/", job.Track.Name, job.Track.ID)
+			s.db.Exec(`
+				UPDATE tracks
+				SET demucs_status = 'completed', demucs_error_message = NULL, updated_at = CURRENT_TIMESTAMP
+				WHERE track_id = ?
+			`, job.Track.ID)
+
+			// Send completed event
+			s.progress.SendEvent(ProgressEvent{
+				TrackID:  job.Track.ID,
+				Type:     "demucs",
 				Status:   "completed",
 				Progress: 100,
 			})
@@ -439,7 +573,12 @@ func (s *Server) setupPlaylistHandler(w http.ResponseWriter, r *http.Request) {
 
 // tracksHandler returns current state snapshot of all tracks
 func (s *Server) tracksHandler(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query("SELECT track_id, name, artists, download_status, error_message FROM tracks")
+	rows, err := s.db.Query(`
+		SELECT track_id, name, artists,
+		       download_status, error_message,
+		       demucs_status, demucs_error_message
+		FROM tracks
+	`)
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
@@ -448,36 +587,46 @@ func (s *Server) tracksHandler(w http.ResponseWriter, r *http.Request) {
 
 	var tracks []TrackState
 	for rows.Next() {
-		var trackID, name, artists, status string
-		var errorMsg sql.NullString
-		rows.Scan(&trackID, &name, &artists, &status, &errorMsg)
+		var trackID, name, artists, downloadStatus, demucsStatus string
+		var downloadError, demucsError sql.NullString
+		rows.Scan(&trackID, &name, &artists, &downloadStatus, &downloadError, &demucsStatus, &demucsError)
 
-		var progress float64
-		var eventStatus string
-		switch status {
+		// Map download status
+		var downloadProgress float64
+		switch downloadStatus {
 		case "completed":
-			progress = 100
-			eventStatus = "completed"
+			downloadProgress = 100
 		case "in_progress":
-			progress = 0 // Real-time progress via SSE
-			eventStatus = "downloading"
-		case "failed":
-			progress = 0
-			eventStatus = "failed"
+			downloadProgress = 0 // Real-time progress via SSE
 		default:
-			progress = 0
-			eventStatus = "pending"
+			downloadProgress = 0
+		}
+
+		// Map demucs status
+		var demucsProgress float64
+		switch demucsStatus {
+		case "completed":
+			demucsProgress = 100
+		case "in_progress":
+			demucsProgress = 0 // Real-time progress via SSE
+		default:
+			demucsProgress = 0
 		}
 
 		track := TrackState{
-			TrackID:  trackID,
-			Name:     name,
-			Artists:  artists,
-			Status:   eventStatus,
-			Progress: progress,
+			TrackID:          trackID,
+			Name:             name,
+			Artists:          artists,
+			DownloadStatus:   downloadStatus,
+			DownloadProgress: downloadProgress,
+			DemucsStatus:     demucsStatus,
+			DemucsProgress:   demucsProgress,
 		}
-		if errorMsg.Valid {
-			track.Error = errorMsg.String
+		if downloadError.Valid {
+			track.DownloadError = downloadError.String
+		}
+		if demucsError.Valid {
+			track.DemucsError = demucsError.String
 		}
 		tracks = append(tracks, track)
 	}
@@ -534,6 +683,7 @@ func main() {
 		spotifyClientID:     os.Getenv("SPOTIFY_CLIENT_ID"),
 		spotifyClientSecret: os.Getenv("SPOTIFY_CLIENT_SECRET"),
 		jobQueue:            make(chan *DownloadJob, 1000),
+		demucsQueue:         make(chan *DemucsJob, 1000),
 		db:                  db,
 		progress:            NewProgressBroadcaster(),
 	}
@@ -553,11 +703,22 @@ func main() {
 		log.Printf("Warning: Failed to load pending jobs: %v", err)
 	}
 
-	// Start worker pool BEFORE starting HTTP server
+	// Load pending Demucs jobs
+	if err := server.loadPendingDemucsJobs(); err != nil {
+		log.Printf("Warning: Failed to load pending Demucs jobs: %v", err)
+	}
+
+	// Start download worker pool BEFORE starting HTTP server
 	for i := 0; i < numWorkers; i++ {
 		go server.worker()
 	}
 	log.Printf("Started %d download workers", numWorkers)
+
+	// Start Demucs worker pool
+	for i := 0; i < numDemucsWorkers; i++ {
+		go server.demucsWorker()
+	}
+	log.Printf("Started %d Demucs workers", numDemucsWorkers)
 
 	// Register handlers
 	http.HandleFunc("/setup-playlist", server.setupPlaylistHandler)
