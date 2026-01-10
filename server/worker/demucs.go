@@ -107,12 +107,6 @@ func ProcessTrackWithDemucs(track models.TrackMetadata, inputPath string, progre
 	containerInputPath := fmt.Sprintf("/songs/%s/base.mp3", trackID)
 	containerOutputDir := fmt.Sprintf("/songs/%s", trackID)
 
-	// Create output directory on host
-	outputDir := filepath.Join("songs", trackID, "demucs")
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("failed to create demucs output directory: %w", err)
-	}
-
 	// Run demucs command
 	args := []string{
 		"exec",
@@ -237,6 +231,6 @@ func ProcessTrackWithDemucs(track models.TrackMetadata, inputPath string, progre
 		return fmt.Errorf("demucs processing failed: %w", cmdErr)
 	}
 
-	fmt.Printf("Demucs processing completed: %s → %s\n", inputPath, outputDir)
+	fmt.Printf("Demucs processing completed: %s → songs/%s/\n", inputPath, trackID)
 	return nil
 }
